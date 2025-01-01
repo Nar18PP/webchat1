@@ -42,7 +42,7 @@ const server = http.createServer(app);
 // Initialize Socket.IO
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173", // หรือโดเมนที่คุณอนุญาตให้เชื่อมต่อ
+    origin: "*", // หรือโดเมนที่คุณอนุญาตให้เชื่อมต่อ
     methods: ["GET", "POST"], // วิธีที่อนุญาตให้ใช้ (GET, POST, เป็นต้น)
   },
 });
