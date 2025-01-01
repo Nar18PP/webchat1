@@ -438,7 +438,7 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
       const [dataChat] = await db
         .promise()
         .query(
-          "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender FROM Message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
+          "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
           [data.chatId]
         );
 
