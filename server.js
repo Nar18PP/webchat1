@@ -6,26 +6,21 @@ import dotenv from "dotenv"; // ใช้ dotenv แทน require
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
-import { v2 as cloudinary } from 'cloudinary';
+import { v2 as cloudinary } from "cloudinary";
 import multer from "multer";
-import { v4 as uuidv4 } from 'uuid';
-import cors from 'cors';  // หรือ require('cors');
+import { v4 as uuidv4 } from "uuid";
+import cors from "cors"; // หรือ require('cors');
+import { verify } from "crypto";
 cloudinary.config({
-  cloud_name: 'dcxgn1tr8',
-  api_key: '775419989726717',
-  api_secret: 'VH5l_5ZBAVz9Y_rVrTpUUg_jtko',
+  cloud_name: "dcxgn1tr8",
+  api_key: "775419989726717",
+  api_secret: "VH5l_5ZBAVz9Y_rVrTpUUg_jtko",
 });
 
 // Set up multer for image file handling
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-
-
-const now = new Date();
-const formattedDate = `${now
-  .toLocaleDateString("en-GB")
-  .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
 function generateRandomSixDigit() {
   return Math.floor(100000 + Math.random() * 900000);
 }
@@ -34,7 +29,7 @@ dotenv.config(); // โหลด environment variables
 
 // Initialize Express
 const app = express();
-app.use(cors())
+app.use(cors());
 app.use(express.json());
 // Create an HTTP server
 const server = http.createServer(app);
@@ -97,25 +92,26 @@ const sendEmail = async (email, socket, res) => {
   }
 };
 
-
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
 
     // Upload to Cloudinary
     const result = await cloudinary.uploader.upload_stream(
-      { resource_type: 'auto', public_id: uuidv4() },
+      { resource_type: "auto", public_id: uuidv4() },
       (error, result) => {
         if (error) {
-          return res.status(500).json({ message: 'Upload failed', error });
+          return res.status(500).json({ message: "Upload failed", error });
         }
-        res.status(200).json({ message: 'Upload successful', url: result.secure_url });
+        res
+          .status(200)
+          .json({ message: "Upload successful", url: result.secure_url });
       }
     );
 
     result.end(file.buffer);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error });
+    res.status(500).json({ message: "Server error", error });
   }
 });
 
@@ -292,7 +288,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("reqListPerson", async (data, res) => {
-    const token = data.token;
+    const { token, createGroup } = data;
 
     if (!token) {
       // return res({ status: "fail", message: "Token not found" });
@@ -305,8 +301,12 @@ io.on("connection", (socket) => {
       // ดึงข้อมูลจากฐานข้อมูลตาม person_id จาก decoded
       const [listPerson] = await db
         .promise()
-        .query("SELECT * FROM `chataliases` chl INNER JOIN chats c ON chl.chat_id = c.chat_id WHERE person_id = ?", [decoded.id]);
-
+        .query(
+          `SELECT * FROM chataliases chl INNER JOIN chats c ON chl.chat_id = c.chat_id WHERE person_id = ? ${
+            createGroup ? "AND chat_type = 'private'" : ""
+          }`,
+          [decoded.id]
+        );
       if (listPerson.length === 0) {
         return res({ status: "fail", message: "No contacts found" });
       }
@@ -344,6 +344,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("addPersonContact", async (data, res) => {
+    const now = new Date();
+    const formattedDate = `${now
+      .toLocaleDateString("en-GB")
+      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
     const [checkNumber] = await db
       .promise()
       .query("SELECT * FROM person WHERE person_number = ?", [data.number]);
@@ -398,17 +402,23 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
                 const [insertAlias] = await db
                   .promise()
                   .query(
-                    `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
-                    [selectChatId[0].chat_id, data.personId, data.name]
+                    `INSERT INTO chataliases (chat_id, person_id, other_person_id, calias_name) values(?, ?, ?, ?)`,
+                    [
+                      selectChatId[0].chat_id,
+                      data.personId,
+                      selPersonIdOther[0].person_id,
+                      data.name,
+                    ]
                   );
                 if (insertAlias) {
                   const [insertAliasOther] = await db
                     .promise()
                     .query(
-                      `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
+                      `INSERT INTO chataliases (chat_id, person_id, other_person_id, calias_name) values(?, ?, ?, ?)`,
                       [
                         selectChatId[0].chat_id,
                         selPersonIdOther[0].person_id,
+                        data.personId,
                         selPersonNumber[0].person_number,
                       ]
                     );
@@ -427,21 +437,74 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
       res({ status: "numberNotFound" });
     }
   });
+  socket.on("createGroup", async (data, res) => {
+    const now = new Date();
+    const formattedDate = `${now
+      .toLocaleDateString("en-GB")
+      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
+    const { token, groupName, members, myId } = data;
+    if (!token) {
+      return;
+    }
+    const user = jwt.verify(token, process.env.JWT_SECRET);
+
+    const [insertChat] = await db
+      .promise()
+      .query(
+        "INSERT INTO chats (chat_datecreate, chat_name, chat_type) values(?, ?, ?)",
+        [formattedDate, groupName, "public"]
+      );
+    if (insertChat) {
+      const [selectChatId] = await db
+        .promise()
+        .query("SELECT chat_id FROM chats ORDER BY chat_id DESC");
+
+      if (selectChatId[0]) {
+        const [insertAlias] = await db
+          .promise()
+          .query(
+            `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
+            [selectChatId[0].chat_id, members[0].person_id, ""]
+          );
+        if (insertAlias) {
+          if (members) {
+            members.map(async (e) => {
+              const [insertAliasOther] = await db
+                .promise()
+                .query(
+                  `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
+                  [selectChatId[0].chat_id, e.other_person_id, e.calias_name]
+                );
+
+              if (insertAliasOther) {
+                res({ status: "succ" });
+              }
+            });
+          }
+        } else {
+          console.log("insertAliasesFail");
+        }
+      }
+    }
+  });
   socket.on("sendMess", async (data) => {
+    const now = new Date();
+    const formattedDate = `${now
+      .toLocaleDateString("en-GB")
+      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
     const [insertMess] = await db
       .promise()
       .query(
-        "INSERT INTO message (msg_text, chat_id, person_id) values(?, ?, ?)",
-        [data.text, data.chatId, data.personId]
+        "INSERT INTO message (msg_text, chat_id, person_id, msg_datesend) values(?, ?, ?, ?)",
+        [data.text, data.chatId, data.personId, formattedDate]
       );
     if (insertMess) {
       const [dataChat] = await db
         .promise()
         .query(
-          "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
+          "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender, m.msg_datesend FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
           [data.chatId]
         );
-
       // ส่งข้อมูลแชทไปยังห้อง
       io.to(data.chatId).emit("chatPrivate", { dataChat: dataChat });
     }
@@ -475,7 +538,7 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
     const [dataChat] = await db
       .promise()
       .query(
-        "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
+        "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender, m.msg_datesend FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
         [roomId]
       );
 
