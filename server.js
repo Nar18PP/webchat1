@@ -499,12 +499,33 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
         [data.text, data.chatId, data.personId, formattedDate]
       );
     if (insertMess) {
-      const [dataChat] = await db
-        .promise()
-        .query(
-          "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender, m.msg_datesend FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
-          [data.chatId]
-        );
+      const [dataChat] = await db.promise().query(
+        `SELECT 
+        c.chat_type, 
+        p.person_id, 
+        m.msg_id, 
+        ca.calias_name, 
+        m.msg_text AS msg_text, 
+        p.person_number AS sender, 
+        m.msg_datesend 
+    FROM 
+        message m
+    JOIN 
+        person p 
+        ON m.person_id = p.person_id
+    JOIN 
+        chataliases ca 
+        ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id
+    JOIN 
+        chats c 
+        ON c.chat_id = m.chat_id
+    WHERE 
+        m.chat_id = ?
+    ORDER BY 
+        m.msg_id ASC;
+    `,
+        [data.chatId]
+      );
       // ส่งข้อมูลแชทไปยังห้อง
       io.to(data.chatId).emit("chatPrivate", { dataChat: dataChat });
     }
@@ -521,10 +542,7 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
     // ตรวจสอบว่าห้องมีอยู่หรือไม่
     if (!usersInRoom[roomId]) {
       usersInRoom[roomId] = [];
-    } else {
-      console.log(`Room ${roomId} already exists.`);
     }
-
     // ตรวจสอบว่า personId นี้อยู่ในห้องแล้วหรือยัง
     if (!usersInRoom[roomId].includes(personId)) {
       usersInRoom[roomId].push(personId);
@@ -532,15 +550,34 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
 
     // ให้ socket เข้าร่วมห้อง
     socket.join(roomId);
-    console.log(`${socket.id} joined room ${roomId}`);
-    console.log(`Current users in room ${roomId}:`, usersInRoom[roomId]);
 
-    const [dataChat] = await db
-      .promise()
-      .query(
-        "SELECT p.person_id, m.msg_id, ca.calias_name, m.msg_text AS msg_text, p.person_number AS sender, m.msg_datesend FROM message m JOIN person p ON m.person_id = p.person_id JOIN chataliases ca ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id WHERE m.chat_id = ? ORDER BY m.msg_id ASC;",
-        [roomId]
-      );
+    const [dataChat] = await db.promise().query(
+      `SELECT 
+    c.chat_type, 
+    p.person_id, 
+    m.msg_id, 
+    ca.calias_name, 
+    m.msg_text AS msg_text, 
+    p.person_number AS sender, 
+    m.msg_datesend 
+FROM 
+    message m
+JOIN 
+    person p 
+    ON m.person_id = p.person_id
+JOIN 
+    chataliases ca 
+    ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id
+JOIN 
+    chats c 
+    ON c.chat_id = m.chat_id
+WHERE 
+    m.chat_id = ?
+ORDER BY 
+    m.msg_id ASC;
+`,
+      [roomId]
+    );
 
     // ส่งข้อมูลแชทไปยังห้อง
     io.to(roomId).emit("chatPrivate", { dataChat: dataChat });
@@ -549,6 +586,16 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
     // if (usersInRoom[roomId].length === 2) {
 
     // }
+  });
+  socket.on("rename", (data, res) => {
+    console.log(data)
+    const { otherPersonId, inputName } = data;
+    const updateName = `UPDATE chataliases SET calias_name = ? WHERE other_person_id = ?`;
+    db.query(updateName, [inputName, otherPersonId], (err, sult)=>{
+      if(sult){
+        res({status: 'succ'})
+      }
+    })
   });
 
   // Handle disconnections
