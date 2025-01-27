@@ -47,7 +47,6 @@ const db = mysql.createConnection({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  port: process.env.DB_PORT,
 });
 
 // Connect to MySQL database
@@ -288,7 +287,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("reqListPerson", async (data, res) => {
+  socket.on("reqListPerson", async (data) => {
     const { token, createGroup } = data;
 
     if (!token) {
@@ -301,26 +300,52 @@ io.on("connection", (socket) => {
 
       // ดึงข้อมูลจากฐานข้อมูลตาม person_id จาก decoded
       const [listPerson] = await db
-        .promise()
-        .query(
-          `SELECT * FROM chataliases chl INNER JOIN chats c ON chl.chat_id = c.chat_id WHERE person_id = ? ${
-            createGroup ? "AND chat_type = 'private'" : ""
-          }`,
-          [decoded.id]
-        );
-      if (listPerson.length === 0) {
-        return res({ status: "fail", message: "No contacts found" });
-      }
-      // ส่งข้อมูลกลับ
-      return res({
-        status: "succ",
-        listPerson: listPerson,
-        personId: decoded.id,
-      });
+      .promise()
+      .query(
+        `SELECT 
+            chl.chat_id,
+            MAX(chl.other_person_id) AS other_person_id,
+            MAX(c.chat_name) AS chat_name,
+            MAX(c.chat_type) AS chat_type,
+            GROUP_CONCAT(DISTINCT chl.calias_name ORDER BY chl.calias_name) AS calias_name,
+            ANY_VALUE(subquery.msg_text) AS latest_message,
+            MAX(subquery.msg_datesend) AS latest_msg_datesend
+         FROM 
+            chataliases chl
+         INNER JOIN 
+            chats c ON chl.chat_id = c.chat_id
+         LEFT JOIN (
+             SELECT 
+                 m.chat_id,
+                 m.msg_text,
+                 m.msg_datesend
+             FROM 
+                 message m
+             WHERE 
+                 m.msg_datesend = (
+                     SELECT MAX(msg_datesend)
+                     FROM message
+                     WHERE chat_id = m.chat_id
+                 )
+         ) subquery ON c.chat_id = subquery.chat_id
+         WHERE 
+            chl.person_id = ? ${
+              createGroup ? "AND c.chat_type = 'private'" : ""
+            }
+         GROUP BY 
+            chl.chat_id
+         ORDER BY 
+            latest_msg_datesend DESC
+        `,
+        [decoded.id]
+      );
+
+      socket.emit('resListPerson', {listPerson, personId: decoded.id})
+      return;
+
     } catch (err) {
       console.error(err); // log ข้อผิดพลาดสำหรับ debugging
       // ถ้าเกิดข้อผิดพลาด เช่น token หมดอายุ หรือผิดพลาดอื่นๆ
-      return res({ status: "fail", message: "Invalid or expired token" });
     }
   });
   socket.on("reqPersonId", async (data, res) => {
@@ -360,7 +385,9 @@ JOIN chataliases b
   ON a.chat_id = b.chat_id
 JOIN person p
   ON b.person_id = p.person_id
-WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
+JOIN chats ch
+  ON b.chat_id = ch.chat_id
+WHERE a.person_id = ? AND b.person_id != ? AND p.person_number = ? AND ch.chat_type = 'private';`,
         [data.personId, data.personId, data.number]
       );
 
@@ -443,7 +470,7 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
     const formattedDate = `${now
       .toLocaleDateString("en-GB")
       .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
-    const { token, groupName, members, myId } = data;
+    const { token, groupName, members } = data;
     if (!token) {
       return;
     }
@@ -465,7 +492,7 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
           .promise()
           .query(
             `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
-            [selectChatId[0].chat_id, members[0].person_id, ""]
+            [selectChatId[0].chat_id, user.id, ""]
           );
         if (insertAlias) {
           if (members) {
@@ -489,6 +516,13 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
     }
   });
   socket.on("sendMess", async (data) => {
+    const [checkRoom] = await db.promise().query(
+      `SELECT * FROM chats WHERE chat_id = ?`, [data.chatId]
+    )
+    if(checkRoom.length < 1){
+      socket.emit('notRoom')
+      return;
+    }
     const now = new Date();
     const formattedDate = `${now
       .toLocaleDateString("en-GB")
@@ -549,8 +583,18 @@ WHERE a.person_id = ? AND b.person_id != ? AND person_number = ?;`,
       usersInRoom[roomId].push(personId);
     }
 
+    const [checkRoom] = await db.promise().query(
+      `SELECT * FROM chats WHERE chat_id = ?`, [roomId]
+    )
+    if(checkRoom.length < 1){
+      socket.emit('notRoom')
+      return;
+    }
+
     // ให้ socket เข้าร่วมห้อง
     socket.join(roomId);
+
+
 
     const [dataChat] = await db.promise().query(
       `SELECT 
@@ -580,8 +624,9 @@ ORDER BY
       [roomId]
     );
 
-    // ส่งข้อมูลแชทไปยังห้อง
     io.to(roomId).emit("chatPrivate", { dataChat: dataChat });
+
+    // ส่งข้อมูลแชทไปยังห้อง
 
     // // ถ้าผู้ใช้งานครบ 2 คน
     // if (usersInRoom[roomId].length === 2) {
@@ -598,6 +643,14 @@ ORDER BY
       }
     })
   });
+
+  socket.on('deleteChat', async (data)=>{
+    const {chatId} = data;
+    const [deleteRoom] = await db.promise().query(`DELETE FROM chats Where chat_id = ?`, [chatId]);
+    if(deleteRoom){
+
+    }
+  })
 
   // Handle disconnections
   socket.on("disconnect", () => {
