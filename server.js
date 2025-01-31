@@ -1,63 +1,54 @@
-import express from "express";
-import http from "http";
+import express, { response } from "express";
+import cors from "cors";
 import { Server } from "socket.io";
-import mysql from "mysql2";
-import dotenv from "dotenv"; // ใช้ dotenv แทน require
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import http from "http";
+import dotenv from "dotenv";
+import cookieParser from "cookie-parser";
 import nodemailer from "nodemailer";
-import { v2 as cloudinary } from "cloudinary";
+import jwt from "jsonwebtoken";
+import { sequelize, connectDB } from "./models/database.js";
+import bcrypt from "bcryptjs";
 import multer from "multer";
-import { v4 as uuidv4 } from "uuid";
-import cors from "cors"; // หรือ require('cors');
-import { verify } from "crypto";
-cloudinary.config({
-  cloud_name: "dcxgn1tr8",
-  api_key: "775419989726717",
-  api_secret: "VH5l_5ZBAVz9Y_rVrTpUUg_jtko",
-});
+import { fileURLToPath } from "url";
+import path from "path";
+import fs from "fs";
+import sharp from "sharp";
+dotenv.config(); // โหลดไฟล์ .env
 
-// Set up multer for image file handling
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const now = new Date();
+const formattedDate = `${now
+  .toLocaleDateString("en-GB")
+  .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
 
-function generateRandomSixDigit() {
-  return Math.floor(100000 + Math.random() * 900000);
-}
-
-dotenv.config(); // โหลด environment variables
-
-// Initialize Express
 const app = express();
-app.use(cors());
 app.use(express.json());
-// Create an HTTP server
-const server = http.createServer(app);
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(
+  cors({
+    origin: "*", // ใส่ URL ของ frontend ที่อนุญาต
+  })
+);
 
-// Initialize Socket.IO
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ให้บริการไฟล์ในโฟลเดอร์ uploads
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.use("/img", express.static(path.join(__dirname, "img")));
+
+const server = http.createServer(app);
+// Socket.IO CORS การตั้งค่าเฉพาะ
 const io = new Server(server, {
   cors: {
-    origin: "*", // หรือโดเมนที่คุณอนุญาตให้เชื่อมต่อ
-    methods: ["GET", "POST"], // วิธีที่อนุญาตให้ใช้ (GET, POST, เป็นต้น)
+    origin: "*", // Frontend origin
   },
 });
-// Set up MySQL connection using environment variables
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT,
-});
 
-// Connect to MySQL database
-db.connect((err) => {
-  if (err) {
-    console.error("Database connection failed:", err.stack);
-    return;
-  }
-  console.log("Connected to MySQL database");
-});
+const PORT = process.env.PORT || 3002;
+
+// เชื่อมต่อฐานข้อมูล
+connectDB();
 
 // ตั้งค่าตัวส่งอีเมล
 const transporter = nodemailer.createTransport({
@@ -68,8 +59,8 @@ const transporter = nodemailer.createTransport({
   },
 });
 // ฟังก์ชันส่งอีเมล
-const sendEmail = async (email, socket, res) => {
-  const otp = generateRandomSixDigit();
+const sendEmail = async (email, socket, response) => {
+  const otp = Math.floor(Math.random() * (999999 - 100000 + 1)) + 100000;
 
   const mailOptions1 = {
     from: `Foraling <${process.env.EMAIL_USER}>`,
@@ -80,44 +71,137 @@ const sendEmail = async (email, socket, res) => {
 
   try {
     await transporter.sendMail(mailOptions1);
-    const addOtp = `INSERT INTO person (person_email, person_otp) values(?, '${otp}')`;
-    db.query(addOtp, [email], (err, result) => {
-      if (err) {
-        console.log(err);
-      } else {
-        onCountEmail(email, socket);
+
+    const [result1] = await sequelize.query(
+      "INSERT INTO person (person_email, person_otp) values(?, ?)",
+      {
+        replacements: [email, otp],
       }
-    });
+    );
+    if (result1) {
+      onCountEmail(email, socket);
+      response("sendMailSuccess");
+    }
   } catch (err) {
-    res("sendMailError");
+    response("sendMailError");
   }
 };
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    const file = req.file;
+const validateEmail = (email) => {
+  const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return regex.test(email);
+};
 
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload_stream(
-      { resource_type: "auto", public_id: uuidv4() },
-      (error, result) => {
-        if (error) {
-          return res.status(500).json({ message: "Upload failed", error });
-        }
-        res
-          .status(200)
-          .json({ message: "Upload successful", url: result.secure_url });
+const UPLOAD_FOLDER = path.join(__dirname, "uploads");
+// สร้างโฟลเดอร์ถ้ายังไม่มี
+if (!fs.existsSync(UPLOAD_FOLDER)) {
+  fs.mkdirSync(UPLOAD_FOLDER);
+}
+
+// ตั้งค่าการเก็บไฟล์ที่อัปโหลด
+const storage = multer.memoryStorage(); // เก็บไฟล์ในหน่วยความจำ
+
+const upload = multer({ storage: storage });
+
+// สร้าง route สำหรับการรับไฟล์
+app.post("/upload", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).send("ไม่มีไฟล์ที่อัปโหลด");
+    }
+
+    const outputFileName = Date.now() + ".webp";
+    const outputFilePath = path.join(__dirname, "uploads", outputFileName);
+
+    // const [result] = await sequelize.query(
+    //   "SELECT store_image FROM store WHERE person_id = ?",
+    //   {
+    //     replacements: [req.body.userId],
+    //   }
+    // );
+
+    const [result] = await sequelize.query(
+      "SELECT person_id FROM store WHERE person_id = ?",
+      {
+        replacements: [req.body.userId],
       }
     );
+    if (result.length > 0) {
+      const [result] = await sequelize.query(
+        "SELECT store_image FROM store WHERE person_id = ?",
+        {
+          replacements: [req.body.userId],
+        }
+      );
+      if (result.length > 0) {
+        const [result1] = await sequelize.query(
+          "UPDATE store SET store_image = ? WHERE person_id = ?",
+          {
+            replacements: [outputFileName, req.body.userId],
+          }
+        );
+        const OldNameImg = result[0].store_image;
+        const filePath = path.join(__dirname, "uploads", OldNameImg);
+        console.log(OldNameImg);
+        if (fs.existsSync(filePath)) {
+          fs.unlink(filePath, (err) => {
+            if (err) {
+              console.error("เกิดข้อผิดพลาดในการลบไฟล์:", err);
+            } else {
+              console.log("ลบไฟล์สำเร็จ:", filePath);
+            }
+          });
+        }
+      }
+    } else {
+      const [result] = await sequelize.query(
+        "INSERT INTO imagetest (image, person_id) value(?, ?)",
+        {
+          replacements: [outputFileName, req.body.userId],
+        }
+      );
+    }
+    await sharp(req.file.buffer).webp().toFile(outputFilePath);
 
-    result.end(file.buffer);
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error });
-  }
+    res.status(200).send({
+      message: "อัปโหลดและแปลงไฟล์สำเร็จ",
+      file: outputFileName,
+      nameImgTest: `${outputFileName}`,
+    });
+  } catch (error) {}
 });
 
-// Serve static files (optional, if you have an HTML frontend)
-// app.use(express.static("public"));
+// Endpoint สำหรับการตรวจสอบ token
+app.post("/verify-token", (req, res) => {
+  const { token } = req.body; // ดึง token จาก body ของ request
+  if (!token) {
+    return res
+      .status(401)
+      .json({ status: "invalid", message: "No token provided" });
+  }
+
+  // ใช้ jwt.verify() เพื่อตรวจสอบ token
+  jwt.verify(token, "secretkey", async (err, decoded) => {
+    if (err) {
+      return res
+        .status(401)
+        .json({ status: "invalid", message: "Invalid or expired token" });
+    }
+
+    // ถ้า token valid, ส่งข้อมูลที่ decode มาให้ client
+    const [result] = await sequelize.query(
+      "SELECT person_id FROM person WHERE (person_email = ? OR person_username = ?)",
+      {
+        replacements: [decoded.username, decoded.username],
+      }
+    );
+    res.json({
+      status: "valid",
+      decoded,
+      userId: result[0].person_id,
+    });
+  });
+});
 
 let countEmail = [];
 let intervalCountEmail = [];
@@ -127,7 +211,7 @@ const onCountEmail = async (email, socket) => {
     return; // ถ้ามีการนับอยู่แล้วไม่ต้องเริ่มใหม่
   }
   try {
-    countEmail[email] = 180; // กำหนดเวลาเริ่มต้น 15 วินาที
+    countEmail[email] = 30; // กำหนดเวลาเริ่มต้น 15 วินาที
 
     intervalCountEmail[email] = setInterval(() => {
       countEmail[email] -= 1;
@@ -135,15 +219,12 @@ const onCountEmail = async (email, socket) => {
       console.log(`Email: ${email}, Time left: ${countEmail[email]}`);
 
       if (countEmail[email] <= 0) {
-        db.query(
-          "DELETE FROM person where person_email = ? and person_number IS NULL",
-          [email],
-          (err, result) => {
-            if (result) {
-            }
+        sequelize.query(
+          "DELETE FROM person where person_email = ? and person_fname IS NULL",
+          {
+            replacements: [email],
           }
         );
-
         clearInterval(intervalCountEmail[email]);
         delete intervalCountEmail[email];
         delete countEmail[email];
@@ -152,520 +233,450 @@ const onCountEmail = async (email, socket) => {
   } catch (error) {}
 };
 
-let usersInRoom = {};
+// const sqlSelStoretAllAndLike = `SELECT
+//            s.*, CASE
+//              WHEN l.person_id IS NOT NULL THEN true
+//              ELSE false
+//            END AS is_liked
+//          FROM store s
+//          LEFT JOIN likedshops l
+//            ON s.store_id = l.store_id AND l.person_id = ?;`;
+const sqlSelStoretAllAndLike = `SELECT 
+    s.*,
+    IFNULL(COUNT(l.person_id), 0) AS like_count,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM likedshops l2 
+            WHERE l2.store_id = s.store_id AND l2.person_id = ?
+        ) THEN true
+        ELSE false
+    END AS is_liked
+FROM store s
+LEFT JOIN likedshops l
+    ON s.store_id = l.store_id
+GROUP BY s.store_id, s.store_name
+ORDER BY like_count DESC;
+`;
+const sqlSelStoreAllLike = `SELECT 
+  s.*,
+  true AS is_liked,
+  (SELECT COUNT(*) 
+   FROM likedshops l2 
+   WHERE l2.store_id = s.store_id) AS like_count
+FROM store s
+INNER JOIN likedshops l
+  ON s.store_id = l.store_id
+WHERE l.person_id = ?
+ORDER BY l.likeshops_id DESC;`;
+const sqlSelStoretAll = `SELECT 
+    s.*,
+    IFNULL(COUNT(l.person_id), 0) AS like_count,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM likedshops l2 
+            WHERE l2.store_id = s.store_id
+        ) THEN false
+    END AS is_liked
+FROM store s
+LEFT JOIN likedshops l
+    ON s.store_id = l.store_id
+GROUP BY s.store_id, s.store_name;`;
 
-// Handle Socket.IO connections
+const sqlSelMystore = `SELECT 
+  s.*, 
+  CASE 
+    WHEN EXISTS (
+      SELECT 1 
+      FROM likedshops l 
+      WHERE l.store_id = s.store_id AND l.person_id = ?
+    ) THEN true 
+    ELSE false 
+  END AS is_liked,
+  IFNULL(COUNT(l.store_id), 0) AS like_count
+FROM store s 
+LEFT JOIN likedshops l
+  ON s.store_id = l.store_id
+WHERE s.store_id = ?
+GROUP BY s.store_id, s.store_name;
+`;
+const sqlSelComments = `SELECT * FROM comments where store_id = ? ORDER BY comment_id DESC;`;
+
 io.on("connection", (socket) => {
-  console.log("A user connected:", socket.id);
-  socket.on("sendOtp", (data, res) => {
-    const checkEmail = `SELECT person_email FROM person WHERE person_email = ?`;
-    db.query(checkEmail, [data.email], (err, result) => {
-      if (err) {
-        console.log(err);
-      } else {
-        if (result.length > 0) {
-          res({ status: "emailAlreadyExists" });
-          console.log(55);
-        } else {
-          sendEmail(data.email, socket, res);
+  socket.on("reqDataStoreAll", async (userId) => {
+    if (userId) {
+      const [resultStoreAllAndLike] = await sequelize.query(
+        sqlSelStoretAllAndLike,
+        {
+          replacements: [userId],
         }
-      }
-    });
-  });
-
-  socket.on("Register", async (data, res) => {
-    try {
-      const hashedPassword = await bcrypt.hash(data.password, 10);
-
-      // ตรวจสอบว่าหมายเลขบุคคลซ้ำหรือไม่
-      const [checkResult] = await db
-        .promise()
-        .query("SELECT person_number FROM person WHERE person_number = ?", [
-          data.number,
-        ]);
-
-      if (checkResult.length > 0) {
-        return res({ status: "numberAlreadyExists" });
-      }
-      const [checkOtp] = await db
-        .promise()
-        .query(
-          "SELECT person_email, person_otp FROM person WHERE person_email = ? and person_otp = ?",
-          [data.email, data.otp]
-        );
-      if (checkOtp.length < 1) {
-        return res({ status: "otpIncorrect" });
-      }
-
-      // เพิ่มบุคคลใหม่ในฐานข้อมูล
-      await db
-        .promise()
-        .query(
-          "INSERT INTO person (person_number, person_password, person_email) values(?, ?, ?)",
-          [data.number, hashedPassword, data.email]
-        );
-
-      // ดึง person_id
-      const [personResult] = await db
-        .promise()
-        .query("SELECT person_id FROM person WHERE person_number = ?", [
-          data.number,
-        ]);
-
-      if (personResult.length > 0) {
-        const personId = personResult[0].person_id;
-        db.query(
-          "DELETE FROM person where person_email = ? and person_number IS NULL",
-          [data.email],
-          (err, result) => {
-            if (result) {
-            }
-          }
-        );
-        clearInterval(intervalCountEmail[data.email]);
-        delete intervalCountEmail[data.email];
-        delete countEmail[data.email];
-
-        return res({ status: "succ" });
-      }
-    } catch (err) {
-      console.error(err);
-      res({ status: "error", message: err.message });
-    }
-  });
-
-  socket.on("logIn", async (data, res) => {
-    try {
-      const selectPassword =
-        "SELECT person_id, person_password FROM person WHERE person_number = ?";
-      db.query(selectPassword, [data.number], async (err, result) => {
-        if (err) {
-          console.error(err);
-          return res({ status: "error", message: "Database error" });
-        }
-
-        if (result.length > 0) {
-          const isPasswordValid = await bcrypt.compare(
-            data.password,
-            result[0].person_password
-          );
-
-          if (isPasswordValid) {
-            const token = jwt.sign(
-              { id: result[0].person_id },
-              process.env.JWT_SECRET,
-              { expiresIn: "1h" }
-            );
-            res({ status: "succ", token: token });
-          } else {
-            res({ status: "incorrect" });
-          }
-        } else {
-          res({ status: "personNotFound" });
-        }
+      );
+      const [resultStoreAllLike] = await sequelize.query(sqlSelStoreAllLike, {
+        replacements: [userId],
       });
-    } catch (error) {
-      console.error(error);
-      res({ status: "error", message: "Unexpected error occurred" });
+
+      if (resultStoreAllAndLike && resultStoreAllLike) {
+        // ส่งข้อมูลร้านพร้อมสถานะการกดใจ
+        socket.emit("resDataStoreAll", {
+          resDataStoreAll: resultStoreAllAndLike,
+          resDataStoreAllLike: resultStoreAllLike,
+        });
+      }
+    } else {
+      const [result] = await sequelize.query(sqlSelStoretAll);
+      if (result) {
+        // ส่งข้อมูลร้านทั้งหมด
+        socket.emit("resDataStoreAll", { resDataStoreAll: result });
+      }
     }
   });
-  socket.on("checkToken", (data, res) => {
-    const token = data.token;
-    if (!token) return res({ status: "fail", massage: "tokenNotFound" });
+
+  socket.on("checkUsernameRegister", async (inputUsername, response) => {
     try {
-      jwt.verify(token, process.env.JWT_SECRET);
-      res({ status: "succ" });
-    } catch (err) {
-      res({ status: "fail" });
+      const [result] = await sequelize.query(
+        "SELECT person_username FROM person WHERE person_username = ?",
+        {
+          replacements: [inputUsername],
+        }
+      );
+
+      if (result.length > 0) {
+        response("failed");
+      } else {
+        response("success");
+      }
+    } catch (error) {}
+  });
+  socket.on("checkEmail", async (email, response) => {
+    if (validateEmail(email)) {
+      const [result] = await sequelize.query(
+        "SELECT person_email FROM person WHERE person_email = ?",
+        {
+          replacements: [email],
+        }
+      );
+      if (result.length > 0) {
+        response("have an email");
+      } else {
+        sendEmail(email, socket, response);
+      }
+    } else {
+      response("failed");
     }
   });
   // เมื่อ client ขอเวลาที่เหลือ
-  socket.on("requestCountOtp", (data) => {
-    if (countEmail[data.email]) {
-      socket.emit("countOtp", { countOtp: countEmail[data.email] });
+  socket.on("requestCountOtp", (email) => {
+    if (countEmail[email]) {
+      socket.emit("countOtp", { countOtp: countEmail[email] });
     } else {
       socket.emit("countOtp", { countOtp: 0 }); // ไม่มีการนับคืนค่า 0
     }
   });
-
-  socket.on("reqListPerson", async (data) => {
-    const { token, createGroup } = data;
-
-    if (!token) {
-      // return res({ status: "fail", message: "Token not found" });
-    }
-
-    try {
-      // ตรวจสอบความถูกต้องของ token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-      // ดึงข้อมูลจากฐานข้อมูลตาม person_id จาก decoded
-      const [listPerson] = await db
-      .promise()
-      .query(
-        `SELECT 
-            chl.chat_id,
-            MAX(chl.other_person_id) AS other_person_id,
-            MAX(c.chat_name) AS chat_name,
-            MAX(c.chat_type) AS chat_type,
-            GROUP_CONCAT(DISTINCT chl.calias_name ORDER BY chl.calias_name) AS calias_name,
-            ANY_VALUE(subquery.msg_text) AS latest_message,
-            MAX(subquery.msg_datesend) AS latest_msg_datesend
-         FROM 
-            chataliases chl
-         INNER JOIN 
-            chats c ON chl.chat_id = c.chat_id
-         LEFT JOIN (
-             SELECT 
-                 m.chat_id,
-                 m.msg_text,
-                 m.msg_datesend
-             FROM 
-                 message m
-             WHERE 
-                 m.msg_datesend = (
-                     SELECT MAX(msg_datesend)
-                     FROM message
-                     WHERE chat_id = m.chat_id
-                 )
-         ) subquery ON c.chat_id = subquery.chat_id
-         WHERE 
-            chl.person_id = ? ${
-              createGroup ? "AND c.chat_type = 'private'" : ""
-            }
-         GROUP BY 
-            chl.chat_id
-         ORDER BY 
-            latest_msg_datesend DESC
-        `,
-        [decoded.id]
-      );
-
-      socket.emit('resListPerson', {listPerson, personId: decoded.id})
-      return;
-
-    } catch (err) {
-      console.error(err); // log ข้อผิดพลาดสำหรับ debugging
-      // ถ้าเกิดข้อผิดพลาด เช่น token หมดอายุ หรือผิดพลาดอื่นๆ
+  //checkEmailandOtp
+  socket.on("checkEmailandOtp", async (email, otp, response) => {
+    const [result] = await sequelize.query(
+      "SELECT person_email, person_otp FROM person where person_email = ? and person_otp = ?",
+      {
+        replacements: [email, otp],
+      }
+    );
+    if (result.length > 0) {
+      response("checkSuccess");
+    } else {
+      response("checkFailed");
     }
   });
-  socket.on("reqPersonId", async (data, res) => {
-    const token = data.token;
-
-    if (!token) {
-      // return res({ status: "fail", message: "Token not found" });
-    }
-    try {
-      // ตรวจสอบความถูกต้องของ token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      // ส่งข้อมูลกลับ
-      return res({
-        status: "succ",
-        personId: decoded.id,
-      });
-    } catch (err) {
-      console.error(err); // log ข้อผิดพลาดสำหรับ debugging
-      // ถ้าเกิดข้อผิดพลาด เช่น token หมดอายุ หรือผิดพลาดอื่นๆ
-      return res({ status: "fail", message: "Invalid or expired token" });
-    }
-  });
-
-  socket.on("addPersonContact", async (data, res) => {
-    const now = new Date();
-    const formattedDate = `${now
-      .toLocaleDateString("en-GB")
-      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
-    const [checkNumber] = await db
-      .promise()
-      .query("SELECT * FROM person WHERE person_number = ?", [data.number]);
-    if (checkNumber.length > 0) {
-      const [checkNameberContact] = await db.promise().query(
-        `SELECT DISTINCT b.person_id AS other_person_id, p.person_number
-FROM chataliases a
-JOIN chataliases b
-  ON a.chat_id = b.chat_id
-JOIN person p
-  ON b.person_id = p.person_id
-JOIN chats ch
-  ON b.chat_id = ch.chat_id
-WHERE a.person_id = ? AND b.person_id != ? AND p.person_number = ? AND ch.chat_type = 'private';`,
-        [data.personId, data.personId, data.number]
+  //checkPassword
+  socket.on(
+    "insertPersonRegis",
+    async (fname, lname, username, gender, email, password, response) => {
+      const [result] = await sequelize.query(
+        "SELECT person_email FROM person where person_email = ? and person_fname IS NOT NULL",
+        {
+          replacements: [email],
+        }
       );
-
-      const [selPersonIdOther] = await db
-        .promise()
-        .query(
-          "SELECT person_id, person_number FROM person WHERE person_number = ?",
-          [data.number]
-        );
-
-      if (checkNameberContact.length > 0) {
-        res({ status: "numberSaved" });
+      if (result.length > 0) {
+        response("have an email");
       } else {
-        if (selPersonIdOther.length > 0) {
-          const [selPersonNumber] = await db
-            .promise()
-            .query("SELECT person_number FROM person WHERE person_id = ?", [
-              data.personId,
-            ]);
-          if (selPersonNumber.length > 0) {
-            if (
-              selPersonIdOther[0].person_number ===
-              selPersonNumber[0].person_number
-            ) {
-              res({ status: "numberMe" });
-              return;
-            }
-
-            const [insertChat] = await db
-              .promise()
-              .query("INSERT INTO chats (chat_datecreate) values(?)", [
-                formattedDate,
-              ]);
-            if (insertChat) {
-              const [selectChatId] = await db
-                .promise()
-                .query("SELECT chat_id FROM chats ORDER BY chat_id DESC");
-
-              if (selectChatId[0]) {
-                const [insertAlias] = await db
-                  .promise()
-                  .query(
-                    `INSERT INTO chataliases (chat_id, person_id, other_person_id, calias_name) values(?, ?, ?, ?)`,
-                    [
-                      selectChatId[0].chat_id,
-                      data.personId,
-                      selPersonIdOther[0].person_id,
-                      data.name,
-                    ]
-                  );
-                if (insertAlias) {
-                  const [insertAliasOther] = await db
-                    .promise()
-                    .query(
-                      `INSERT INTO chataliases (chat_id, person_id, other_person_id, calias_name) values(?, ?, ?, ?)`,
-                      [
-                        selectChatId[0].chat_id,
-                        selPersonIdOther[0].person_id,
-                        data.personId,
-                        selPersonNumber[0].person_number,
-                      ]
-                    );
-                  if (insertAliasOther) {
-                  }
-                  res({ status: "succ" });
-                } else {
-                  console.log("insertAliasesFail");
-                }
-              }
-            }
+        const [result] = await sequelize.query(
+          "SELECT person_username FROM person where person_username = ? and person_fname IS NOT NULL",
+          {
+            replacements: [username],
           }
+        );
+        if (result.length > 0) {
+          response("have a username");
+        } else {
+          if ((fname, lname, username, gender, email, password)) {
+            const saltRounds = 12;
+            const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+            const [result] = await sequelize.query(
+              "INSERT INTO person (person_fname, person_lname, person_username, person_gender, person_email, person_password) values(?, ?, ?, ?, ?, ?)",
+              {
+                replacements: [
+                  fname,
+                  lname,
+                  username,
+                  gender,
+                  email,
+                  hashedPassword,
+                ],
+              }
+            );
+            if (result) {
+              response("inserted");
+            } else {
+              response("insertFailed");
+            }
+          } else {
+            response("insertFailed");
+          }
+        }
+      }
+    }
+  );
+  socket.on("login", async (email, password, response) => {
+    const [result] = await sequelize.query(
+      "SELECT person_email, person_username, person_password FROM person WHERE (person_email = ? OR person_username = ?)",
+      {
+        replacements: [email, email, password],
+      }
+    );
+    if (result.length > 0) {
+      const hashedPassword = result[0].person_password;
+      const isPasswordValid = await bcrypt.compare(password, hashedPassword);
+      if (isPasswordValid) {
+        const token = jwt.sign(
+          { username: email, password: password },
+          "secretkey",
+          { expiresIn: "1h" }
+        );
+        response({ status: "loginSuccess", token: token });
+      } else {
+        response("incorrectPassword");
+      }
+    } else {
+      response("userNotFound");
+    }
+  });
+  socket.on("requestIdstore", async (userId, response) => {
+    const [resultStoreId] = await sequelize.query(
+      "SELECT * FROM store WHERE person_id = ?",
+      {
+        replacements: [userId],
+      }
+    );
+    if (resultStoreId && resultStoreId.length > 0) {
+      const storeId = resultStoreId[0].store_id;
+      if (resultStoreId.length > 0) {
+        response({ storeId: storeId });
+      }
+    }
+  });
+  socket.on("requestDataMystore", async (userId, storeId, response) => {
+    if (storeId) {
+      const [resultMystore] = await sequelize.query(sqlSelMystore, {
+        replacements: [userId, storeId],
+      });
+      if (resultMystore) {
+        response({ dataMystore: resultMystore });
+      }
+    }
+  });
+  socket.on("requestDataPrivate", async (userId, response) => {
+    const [result] = await sequelize.query(
+      "SELECT * FROM person WHERE person_id = ?",
+      {
+        replacements: [userId],
+      }
+    );
+    response({
+      fname: result[0].person_fname,
+      lname: result[0].person_lname,
+      email: result[0].person_email,
+      image: result[0].person_image,
+      username: result[0].person_username,
+      like: result[0].person_like,
+      view: result[0].person_view,
+      coin: result[0].person_coin,
+    });
+  });
+  socket.on("reqStore", async (data, res) => {
+    if (data.userId) {
+      const [selStoreResult] = await sequelize.query(
+        `SELECT * FROM store WHERE person_id = ?`,
+        {
+          replacements: [data.userId],
+        }
+      );
+      if (selStoreResult) {
+        res(selStoreResult[0]);
+      }
+    }
+  });
+  socket.on("onLike", async (shopId, userId, response) => {
+    // ประกาศตัวแปร result ไว้ข้างนอก
+
+    const [countResult] = await sequelize.query(
+      `SELECT COUNT(*) as count FROM likedshops WHERE person_id = ? AND store_id = ?;`,
+      {
+        replacements: [userId, shopId],
+      }
+    );
+
+    // ตรวจสอบค่าผลลัพธ์
+    if (countResult && countResult[0].count > 0) {
+      // หากมีการกดใจร้านแล้ว ให้ลบการกดใจ
+      const [result] = await sequelize.query(
+        `DELETE FROM likedshops WHERE person_id = ? AND store_id = ?`,
+        {
+          replacements: [userId, shopId],
+        }
+      );
+      if (result) {
+        const [resultStoreAllAndLike] = await sequelize.query(
+          sqlSelStoretAllAndLike,
+          {
+            replacements: [userId],
+          }
+        );
+        const [resultStoreAllLike] = await sequelize.query(sqlSelStoreAllLike, {
+          replacements: [userId],
+        });
+        const [resultMystore] = await sequelize.query(sqlSelMystore, {
+          replacements: [userId, shopId],
+        });
+
+        if (resultStoreAllAndLike && resultStoreAllLike) {
+          // ส่งข้อมูลร้านพร้อมสถานะการกดใจ
+          response({
+            resDataStoreAll: resultStoreAllAndLike,
+            resDataStoreAllLike: resultStoreAllLike,
+            resDataLikeInStore: resultMystore,
+          });
         }
       }
     } else {
-      res({ status: "numberNotFound" });
-    }
-  });
-  socket.on("createGroup", async (data, res) => {
-    const now = new Date();
-    const formattedDate = `${now
-      .toLocaleDateString("en-GB")
-      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
-    const { token, groupName, members } = data;
-    if (!token) {
-      return;
-    }
-    const user = jwt.verify(token, process.env.JWT_SECRET);
-
-    const [insertChat] = await db
-      .promise()
-      .query(
-        "INSERT INTO chats (chat_datecreate, chat_name, chat_type) values(?, ?, ?)",
-        [formattedDate, groupName, "public"]
+      // หากยังไม่มีการกดใจร้าน ให้เพิ่มการกดใจ
+      const [result] = await sequelize.query(
+        `INSERT INTO likedshops (person_id, store_id, likeshops_date) VALUES(?, ?, ?)`,
+        {
+          replacements: [userId, shopId, formattedDate],
+        }
       );
-    if (insertChat) {
-      const [selectChatId] = await db
-        .promise()
-        .query("SELECT chat_id FROM chats ORDER BY chat_id DESC");
-
-      if (selectChatId[0]) {
-        const [insertAlias] = await db
-          .promise()
-          .query(
-            `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
-            [selectChatId[0].chat_id, user.id, ""]
-          );
-        if (insertAlias) {
-          if (members) {
-            members.map(async (e) => {
-              const [insertAliasOther] = await db
-                .promise()
-                .query(
-                  `INSERT INTO chataliases (chat_id, person_id, calias_name) values(?, ?, ?)`,
-                  [selectChatId[0].chat_id, e.other_person_id, e.calias_name]
-                );
-
-              if (insertAliasOther) {
-                res({ status: "succ" });
-              }
-            });
+      if (result) {
+        const [resultStoreAllAndLike] = await sequelize.query(
+          sqlSelStoretAllAndLike,
+          {
+            replacements: [userId],
           }
-        } else {
-          console.log("insertAliasesFail");
+        );
+        const [resultStoreAllLike] = await sequelize.query(sqlSelStoreAllLike, {
+          replacements: [userId],
+        });
+        const [resultMystore] = await sequelize.query(sqlSelMystore, {
+          replacements: [userId, shopId],
+        });
+
+        if (resultStoreAllAndLike.length > 0 && resultStoreAllLike.length > 0) {
+          // ส่งข้อมูลร้านพร้อมสถานะการกดใจ
+          response({
+            resDataStoreAll: resultStoreAllAndLike,
+            resDataStoreAllLike: resultStoreAllLike,
+            resDataLikeInStore: resultMystore,
+          });
         }
       }
     }
   });
-  socket.on("sendMess", async (data) => {
-    const [checkRoom] = await db.promise().query(
-      `SELECT * FROM chats WHERE chat_id = ?`, [data.chatId]
-    )
-    if(checkRoom.length < 1){
-      socket.emit('notRoom')
-      return;
-    }
-    const now = new Date();
-    const formattedDate = `${now
-      .toLocaleDateString("en-GB")
-      .replace(/\//g, "/")} ${now.toLocaleTimeString("en-GB")}`;
-    const [insertMess] = await db
-      .promise()
-      .query(
-        "INSERT INTO message (msg_text, chat_id, person_id, msg_datesend) values(?, ?, ?, ?)",
-        [data.text, data.chatId, data.personId, formattedDate]
-      );
-    if (insertMess) {
-      const [dataChat] = await db.promise().query(
-        `SELECT 
-        c.chat_type, 
-        p.person_id, 
-        m.msg_id, 
-        ca.calias_name, 
-        m.msg_text AS msg_text, 
-        p.person_number AS sender, 
-        m.msg_datesend 
-    FROM 
-        message m
-    JOIN 
-        person p 
-        ON m.person_id = p.person_id
-    JOIN 
-        chataliases ca 
-        ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id
-    JOIN 
-        chats c 
-        ON c.chat_id = m.chat_id
-    WHERE 
-        m.chat_id = ?
-    ORDER BY 
-        m.msg_id ASC;
-    `,
-        [data.chatId]
-      );
-      // ส่งข้อมูลแชทไปยังห้อง
-      io.to(data.chatId).emit("chatPrivate", { dataChat: dataChat });
-    }
-  });
 
-  socket.on("joinRoom", async (data) => {
-    const { roomId, personId } = data;
+  socket.on(
+    "createStore",
+    async (userId, inputName, inputDetail, nameImg, response) => {
+      try {
+        const [result] = await sequelize.query(
+          "INSERT INTO store (store_name, store_detail, store_image, store_creationdate ,person_id) VALUES (?, ?, ?, ?, ?)",
+          {
+            replacements: [
+              inputName,
+              inputDetail,
+              nameImg,
+              formattedDate,
+              userId,
+            ],
+          }
+        );
 
-    if (!roomId || !personId) {
-      console.error("Invalid data received:", data);
-      return;
-    }
+        if (result) {
+          response({ status: "createSuccess" });
+          const [resultStoreAllAndLike] = await sequelize.query(
+            sqlSelStoretAllAndLike,
+            {
+              replacements: [userId],
+            }
+          );
 
-    // ตรวจสอบว่าห้องมีอยู่หรือไม่
-    if (!usersInRoom[roomId]) {
-      usersInRoom[roomId] = [];
-    }
-    // ตรวจสอบว่า personId นี้อยู่ในห้องแล้วหรือยัง
-    if (!usersInRoom[roomId].includes(personId)) {
-      usersInRoom[roomId].push(personId);
-    }
-
-    const [checkRoom] = await db.promise().query(
-      `SELECT * FROM chats WHERE chat_id = ?`, [roomId]
-    )
-    if(checkRoom.length < 1){
-      socket.emit('notRoom')
-      return;
-    }
-
-    // ให้ socket เข้าร่วมห้อง
-    socket.join(roomId);
-
-
-
-    const [dataChat] = await db.promise().query(
-      `SELECT 
-    c.chat_type, 
-    p.person_id, 
-    m.msg_id, 
-    ca.calias_name, 
-    m.msg_text AS msg_text, 
-    p.person_number AS sender, 
-    m.msg_datesend 
-FROM 
-    message m
-JOIN 
-    person p 
-    ON m.person_id = p.person_id
-JOIN 
-    chataliases ca 
-    ON ca.person_id = p.person_id AND ca.chat_id = m.chat_id
-JOIN 
-    chats c 
-    ON c.chat_id = m.chat_id
-WHERE 
-    m.chat_id = ?
-ORDER BY 
-    m.msg_id ASC;
-`,
-      [roomId]
-    );
-
-    io.to(roomId).emit("chatPrivate", { dataChat: dataChat });
-
-    // ส่งข้อมูลแชทไปยังห้อง
-
-    // // ถ้าผู้ใช้งานครบ 2 คน
-    // if (usersInRoom[roomId].length === 2) {
-
-    // }
-  });
-  socket.on("rename", (data, res) => {
-    console.log(data)
-    const { otherPersonId, inputName } = data;
-    const updateName = `UPDATE chataliases SET calias_name = ? WHERE other_person_id = ?`;
-    db.query(updateName, [inputName, otherPersonId], (err, sult)=>{
-      if(sult){
-        res({status: 'succ'})
+          if (resultStoreAllAndLike) {
+            // ส่งข้อมูลร้านพร้อมสถานะการกดใจ
+            io.emit("resDataStoreAll", {
+              resDataStoreAll: resultStoreAllAndLike,
+            });
+          }
+        } else {
+          response({ status: "error" });
+        }
+      } catch (error) {
+        console.error("Error creating store:", error);
+        response({ status: "error", message: error.message });
       }
-    })
-  });
-
-  socket.on('deleteChat', async (data)=>{
-    const {chatId} = data;
-    const [deleteRoom] = await db.promise().query(`DELETE FROM chats Where chat_id = ?`, [chatId]);
-    if(deleteRoom){
-
+    }
+  );
+  socket.on('reqComments', async (data)=>{
+    if(data){
+      const [resultComments] = await sequelize.query(sqlSelComments, {
+        replacements: [data.storeId],
+      });
+      if (resultComments.length > 0) {
+        socket.emit("resComments", { comments: resultComments });
+      }
     }
   })
+  socket.on("addComment", async (data) => {
+    const [resultAddCm] = await sequelize.query(
+      "INSERT INTO comments (store_id, person_id, comment_data, comment_like, comment_dislike, comment_datetime) VALUES (?, ?, ?, ?, ?, ?)",
+      {
+        replacements: [
+          data.storeId,
+          data.userId,
+          data.inputComment,
+          0,
+          0,
+          formattedDate,
+        ],
+      }
+    );
+    
+    if (resultAddCm) {
+      const [resultComments] = await sequelize.query(sqlSelComments, {
+        replacements: [data.storeId],
+      });
+      if (resultComments.length > 0) {
+        socket.emit("resComments", { comments: resultComments });
+      }
+    }
+  });
 
-  // Handle disconnections
+
+
   socket.on("disconnect", () => {
-    console.log("A user disconnected:", socket.id);
+    console.log(`User disconnected: ${socket.id}`);
   });
 });
 
-// Define a simple route
-app.get("/", (req, res) => {
-  res.send("<h1>Hello, Socket.IO!</h1>");
-});
-
-// Start the server
-const PORT = 3000;
+// Start server
 server.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
